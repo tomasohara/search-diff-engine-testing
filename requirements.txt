@@ -1,0 +1,6 @@
+# Python module versions required for blackbox testing of search-diff-engine
+mezcla==1.4.0.3
+selenium
+pytest
+pylint
+requests
