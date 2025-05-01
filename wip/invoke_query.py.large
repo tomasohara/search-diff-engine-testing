@@ -1,0 +1,320 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+End-to-end test script for Scrappycito search engine using Selenium.
+Invokes search queries and verifies results count and relevance.
+
+Sample usage:
+  python scrappycito_test.py --query "democracy at risk"
+"""
+# Standard Modules
+import re
+import time
+import urllib.parse
+from typing import List, Dict, Any, Optional, Set
+
+# Installed Modules
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+
+# Mezcla Modules
+from mezcla import debug
+from mezcla import glue_helpers as gh
+from mezcla.main import Main
+from mezcla.my_regex import my_re
+from mezcla import system
+
+# Constants
+TL = debug.TL
+SCRAPPYCITO_MAIN = "http://www.scrappycito.com:9330"
+SCRAPPYCITO_ALT = "http://www.tomasohara.trade:9330"
+EXPECTED_MIN_RESULTS = 10
+RELEVANCE_THRESHOLD = 0.5
+FUNCTION_WORDS = {"at", "the", "in", "on", "of", "and", "or", "a", "an", "for", "to", "with", "by"}
+PAGE_LOAD_TIMEOUT = 30
+QUERY_WAIT_TIMEOUT = 60
+
+# Environment Options
+SCRAPPYCITO_URL = system.getenv_text(
+    "SCRAPPYCITO_URL", SCRAPPYCITO_MAIN, 
+    description="Scrappycito URL for scraping"
+)
+USE_ALTERNATIVE_URL = system.getenv_bool(
+    "USE_ALTERNATIVE_URL", False, 
+    description=f"Use alternative URL for scraping ({SCRAPPYCITO_ALT})"
+)
+USE_CHROME_DRIVER = system.getenv_bool(
+    "USE_CHROME_DRIVER", False, 
+    description="Use Chrome WebDriver for Selenium (uses Firefox by default)"
+)
+SELENIUM_HEADLESS = system.getenv_bool(
+    "SELENIUM_HEADLESS", True,
+    description="Run browser in headless mode"
+)
+SLEEP_TIME = system.getenv_int(
+    "SLEEP_TIME", 5, 
+    description="Sleep time in seconds after loading the page"
+)
+TEST_VERBOSE = system.getenv_bool(
+    "TEST_VERBOSE", True,
+    description="Show detailed test results"
+)
+
+# Argument Constants
+QUERY_ARG = "query"
+
+
+class QueryInvoker:
+    """Class for handling search query construction, browser setup and result extraction"""
+    
+    def __init__(self, use_chrome=USE_CHROME_DRIVER, headless=SELENIUM_HEADLESS):
+        """Initialize with browser configuration options and set up the WebDriver"""
+        self.driver = self._setup_browser(use_chrome, headless)
+        
+    def _setup_browser(self, use_chrome, headless):
+        """Set up and configure the browser"""
+        try:
+            if use_chrome:
+                debug.trace(3, "Setting up Chrome browser")
+                options = ChromeOptions()
+                if headless:
+                    options.add_argument("--headless")
+                    debug.trace(4, "Running Chrome in headless mode")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                options.add_argument("--disable-gpu")
+                driver = webdriver.Chrome(options=options)
+            else:
+                debug.trace(3, "Setting up Firefox browser")
+                options = FirefoxOptions()
+                options.set_preference("marionette.debugging.clicktostart", False)
+                options.set_preference("marionette", True)
+                options.set_preference("browser.download.folderList", 2)
+                options.set_preference("browser.download.manager.showWhenStarting", False)
+                if headless:
+                    options.add_argument("--headless")
+                    debug.trace(4, "Running Firefox in headless mode")
+                driver = webdriver.Firefox(options=options)
+            
+            # Set page load timeout
+            driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+            return driver
+        except WebDriverException as e:
+            debug.trace_fmtd(1, "Failed to initialize WebDriver: {e}", e=str(e))
+            raise
+        
+    def create_url(self, query):
+        """Create the search URL with the encoded query"""
+        encoded_query = urllib.parse.quote_plus(query)
+        url = SCRAPPYCITO_URL if not USE_ALTERNATIVE_URL else SCRAPPYCITO_ALT
+        return f"{url}/run_search?query={encoded_query}&its-me=on"
+        
+    def extract_query_results(self, url, query_terms):
+        """Navigate to URL and extract search results with relevance checking"""
+        try:
+            debug.trace(3, f"Navigating to: {url}")
+            
+            try:
+                self.driver.get(url)
+            except TimeoutException:
+                debug.trace(2, f"Page load timed out after {PAGE_LOAD_TIMEOUT}s, but continuing anyway")
+            
+            # Wait for results to appear
+            try:
+                wait = WebDriverWait(self.driver, QUERY_WAIT_TIMEOUT)
+                wait.until(EC.presence_of_element_located((By.CLASS_NAME, "cell-text")))
+            except TimeoutException:
+                debug.trace(2, f"Timed out waiting for search results after {QUERY_WAIT_TIMEOUT}s")
+                return [], 0, 0, None
+                
+            # Extract result statistics
+            result_stats = None
+            try:
+                stats_element = self.driver.find_element(By.CLASS_NAME, "result-stats")
+                result_stats = stats_element.text
+                debug.trace(3, f"Found result stats: {result_stats}")
+            except NoSuchElementException:
+                debug.trace(2, "No result statistics found")
+            
+            # Extract search results
+            search_results = self.driver.find_elements(By.CLASS_NAME, "cell-text")
+            result_list = []
+            
+            if len(search_results) < 3:
+                debug.trace(2, "Warning: Not enough search results found")
+                return [], 0, 0, result_stats
+                
+            debug.trace(4, f"Found {len(search_results)} elements")
+            for i in range(0, len(search_results) - 2, 3):
+                if i + 2 < len(search_results):
+                    title = search_results[i].text
+                    website = search_results[i + 1].text
+                    snippet = search_results[i + 2].text
+                    
+                    result_list.append({
+                        "title": title,
+                        "website": website,
+                        "snippet": snippet,
+                        "query_terms": snippet.split("; ") if "; " in snippet else []
+                    })
+            
+            # Remove last item if it exists (it's usually incomplete)
+            if result_list and len(result_list) > 0:
+                result_list.pop()
+                
+            # Calculate how many results contain query terms
+            non_function_terms = self._get_non_function_words(query_terms)
+            relevant_count = 0
+            
+            for result in result_list:
+                if self._is_result_relevant(result, non_function_terms):
+                    relevant_count += 1
+            
+            relevance_ratio = relevant_count / len(result_list) if result_list else 0
+            
+            debug.trace(3, f"Extracted {len(result_list)} results, {relevant_count} relevant ({relevance_ratio:.1%})")
+            return result_list, relevant_count, relevance_ratio, result_stats
+            
+        except Exception as e:
+            debug.trace_fmtd(2, "Error extracting results: {e}", e=str(e))
+            return [], 0, 0, None
+    
+    def _get_non_function_words(self, query: str) -> Set[str]:
+        """Extract non-function words from query"""
+        words = set(re.findall(r'\b\w+\b', query.lower()))
+        return words - FUNCTION_WORDS
+    
+    def _is_result_relevant(self, result: Dict[str, Any], query_terms: Set[str]) -> bool:
+        """Check if a result contains any of the query terms"""
+        combined_text = f"{result['title']} {result['snippet']}".lower()
+        
+        for term in query_terms:
+            if term.lower() in combined_text:
+                return True
+        return False
+            
+    def run_query(self, query):
+        """Run a query and return results with relevance metrics"""
+        url = self.create_url(query)
+        results, relevant_count, relevance_ratio, stats = self.extract_query_results(url, query)
+        return results, relevant_count, relevance_ratio, stats
+        
+    def close(self):
+        """Close the browser and clean up resources"""
+        debug.trace(5, "Closing browser")
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception as e:
+                debug.trace_fmtd(3, "Error closing browser: {e}", e=str(e))
+
+
+class ScrappycitoTest(Main):
+    """End-to-end test for Scrappycito search engine"""
+    
+    query = None
+    invoker = None
+    
+    def setup(self):
+        """Extract argument values and set up QueryInvoker"""
+        self.query = self.get_parsed_option(QUERY_ARG)
+        if not self.query:
+            self.query = "democracy at risk"  # Default query as per requirements
+            
+        debug.trace_fmtd(TL.VERBOSE, "Query to test: {q}", q=self.query)
+        
+        # Create the QueryInvoker which handles browser setup
+        try:
+            self.invoker = QueryInvoker(USE_CHROME_DRIVER, SELENIUM_HEADLESS)
+            debug.trace(3, "QueryInvoker initialized with browser")
+        except Exception as e:
+            debug.trace_fmtd(1, "Failed to initialize QueryInvoker: {e}", e=str(e))
+            raise
+
+    def run_main_step(self):
+        """Main test execution logic"""
+        print(f"Running Scrappycito E2E test with query: '{self.query}'")
+        
+        # Run search using the invoker
+        results, relevant_count, relevance_ratio, stats = self.invoker.run_query(self.query)
+        
+        # Perform test assertions
+        test_passed = True
+        failures = []
+        
+        # Test 1: Check if we have enough results
+        if len(results) < EXPECTED_MIN_RESULTS:
+            test_passed = False
+            failures.append(f"Expected at least {EXPECTED_MIN_RESULTS} results, but got {len(results)}")
+        
+        # Test 2: Check relevance ratio
+        if relevance_ratio < RELEVANCE_THRESHOLD:
+            test_passed = False
+            failures.append(f"Expected at least {RELEVANCE_THRESHOLD:.0%} relevant results, but got {relevance_ratio:.1%}")
+        
+        # Test 3: Check if result stats exist and make sense
+        if not stats:
+            failures.append("Warning: No result statistics found")
+        else:
+            # Basic sanity check for stats (should contain numbers)
+            if not re.search(r'\d+', stats):
+                failures.append(f"Result statistics don't contain numbers: '{stats}'")
+        
+        # Display results
+        print("\n--- TEST RESULTS ---")
+        print(f"Query: '{self.query}'")
+        print(f"Results count: {len(results)}")
+        print(f"Relevant results: {relevant_count}/{len(results)} ({relevance_ratio:.1%})")
+        print(f"Result stats: {stats}")
+        
+        if test_passed:
+            print("\n✅ TEST PASSED ✅")
+        else:
+            print("\n❌ TEST FAILED ❌")
+            print("Failures:")
+            for failure in failures:
+                print(f"  - {failure}")
+        
+        # Display detailed results if verbose mode is enabled
+        if TEST_VERBOSE and results:
+            print("\n--- DETAILED RESULTS ---")
+            non_function_terms = self.invoker._get_non_function_words(self.query)
+            
+            for i, result in enumerate(results, 1):
+                is_relevant = self.invoker._is_result_relevant(result, non_function_terms)
+                relevance_marker = "✓" if is_relevant else "✗"
+                
+                print(f"\nResult {i} [{relevance_marker}]:")
+                print(f"  Title: {result['title']}")
+                print(f"  Website: {result['website']}")
+                print(f"  Snippet: {result['snippet'][:100]}...")
+
+    def wrap_up(self):
+        """Cleanup resources"""
+        if self.invoker:
+            debug.trace(4, "Cleaning up QueryInvoker resources")
+            self.invoker.close()
+
+
+def main():
+    """Entry point"""
+    app = ScrappycitoTest(
+        description=__doc__,
+        manual_input=True,
+        skip_input=True,
+        text_options=[(QUERY_ARG, "Search query for testing (default: 'democracy at risk')")],
+        auto_help=True
+    )
+    app.run()
+
+
+if __name__ == "__main__":
+    debug.trace_current_context(level=TL.QUITE_VERBOSE)
+    debug.trace(5, f"module __doc__: {__doc__}")
+    main()
